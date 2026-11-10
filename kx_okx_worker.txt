@@ -1,0 +1,102 @@
+// KX OKX Spot alerts - informational only. No real trades.
+const PAIRS = ['BTC-USDT', 'ETH-USDT', 'SOL-USDT', 'XRP-USDT'];
+const API = 'https://www.okx.com/api/v5/market/';
+
+async function get(path) {
+  const res = await fetch(API + path, {headers: {'Accept': 'application/json'}});
+  if (!res.ok) throw new Error('OKX HTTP ' + res.status);
+  const data = await res.json();
+  if (data.code !== '0' || !Array.isArray(data.data)) throw new Error('Bad OKX data');
+  return data.data;
+}
+
+function bars(raw) {
+  return raw.filter(r => r[8] === '1').map(r => ({
+    t: Number(r[0]), h: +r[2], l: +r[3], c: +r[4], v: +r[7]
+  })).sort((a,b) => a.t-b.t);
+}
+function mean(a) { return a.reduce((x,y) => x+y, 0)/a.length; }
+function rsi(a) {
+  let up=0, down=0;
+  for (let i=a.length-14; i<a.length; i++) {
+    const d = a[i].c-a[i-1].c;
+    up += Math.max(d,0); down += Math.max(-d,0);
+  }
+  return down === 0 ? (up === 0 ? 50 : 100) : 100 - 100/(1+up/down);
+}
+
+async function analyze(pair) {
+  const id = encodeURIComponent(pair);
+  const [t, a, b] = await Promise.all([
+    get('ticker?instId='+id),
+    get('candles?instId='+id+'&bar=4H&limit=60'),
+    get('candles?instId='+id+'&bar=1Dutc&limit=65')
+  ]);
+  const q = t[0], h = bars(a), d = bars(b);
+  if (!q || h.length < 25 || d.length < 55) return null;
+  const ask=+q.askPx, bid=+q.bidPx, last=+q.last, vol=+q.volCcy24h;
+  const ts=Number(q.ts), spread=(ask-bid)/ask;
+  if (![ask,bid,last,vol,ts].every(Number.isFinite) ||
+      !(ask>bid && bid>0 && vol>5000000 && spread<0.002) ||
+      Math.abs(Date.now()-ts)>120000) return null;
+
+  const recent=h[h.length-1], prev=h[h.length-2];
+  const history=h.slice(-22,-2);
+  const resistance=Math.max(...history.map(x=>x.h));
+  const ma20=mean(d.slice(-20).map(x=>x.c));
+  const ma50=mean(d.slice(-50).map(x=>x.c));
+  const checks=[
+    d[d.length-1].c>ma20 && ma20>ma50,
+    prev.c>resistance*1.001,
+    recent.l<=resistance*1.006 && recent.c>resistance*1.002,
+    rsi(h)>52 && rsi(h)<68,
+    prev.v>mean(history.map(x=>x.v))*1.3
+  ];
+  if (!checks.every(Boolean) || Math.abs(ask/recent.c-1)>0.012) return null;
+  const stop=Math.min(recent.l, resistance*0.985), risk=ask-stop;
+  if (risk/ask<0.005 || risk/ask>0.04) return null;
+  return {pair, price:ask, stop, target:ask+2*risk,
+          time:new Date(ts).toISOString()};
+}
+
+async function notify(env, msg) {
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
+    throw new Error('Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID secrets');
+  }
+  const url='https://api.telegram.org/bot'+env.TELEGRAM_BOT_TOKEN+'/sendMessage';
+  const res=await fetch(url,{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({chat_id:env.TELEGRAM_CHAT_ID,text:msg})});
+  const data=await res.json();
+  if (!res.ok || !data.ok) throw new Error('Telegram rejected message');
+}
+
+async function run(env) {
+  for (const pair of PAIRS) {
+    try {
+      const s=await analyze(pair);
+      if (!s) continue; // WAIT = no notification
+      const num=n=>Number(n).toLocaleString('en-US',{maximumFractionDigits:6});
+      await notify(env,
+        '🟢 سیگناڵی مەرجداری کڕین (Spot): '+s.pair+'\n'+
+        'نرخی چوونەژوورەوە: '+num(s.price)+' USDT\n'+
+        'ئاستی هەڵوەشاندنەوە: '+num(s.stop)+' USDT\n'+
+        'ئامانجی نموونەیی: '+num(s.target)+' USDT\n'+
+        'بڕی یەکەم: زۆرترین 10 USDT، ئەگەر کەمترین داواکاریی OKX ڕێگە بدات\n'+
+        'پێنج لە پێنج مەرجی تەکنیکی؛ نەک ١٠٠٪ ئەگەری قازانج\n'+
+        'کاتی نرخی OKX: '+s.time+'\n'+
+        '⚠️ نرخ دەتوانێت دابەزێت. پێش کڕین نرخی نوێ و کرێکان بپشکنە. قازانج گەرەنتی نییە.'
+      );
+    } catch(e) { console.error(pair, e.message); }
+  }
+}
+
+export default {
+  async fetch() { return new Response('KX OKX Spot alert bot deployed; alerts require secrets and cron.'); },
+  async scheduled(event, env, ctx) {
+    // Only consider new closed 4H candles once, 10 minutes after close (UTC).
+    const at = new Date(event.scheduledTime);
+    if (at.getUTCHours()%4===0 && at.getUTCMinutes()===10) {
+      ctx.waitUntil(run(env));
+    }
+  }
+};
